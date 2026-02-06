@@ -83,6 +83,7 @@ print(f"是否通过: {result.accepted}")
 | [04-使用数据集.md](04-使用数据集.md) | 评估数据集使用指南 |
 | [05-API参考.md](05-API参考.md) | REST API 和数据模型参考 |
 | [06-veRL框架集成指南.md](06-veRL框架集成指南.md) | **veRL 强化学习框架集成** - RL 训练中使用 SandboxFusion |
+| [07-部署问题修复记录.md](07-部署问题修复记录.md) | **部署问题修复** - Conda 路径、SDK 字段缺失、环境激活等 |
 
 ---
 

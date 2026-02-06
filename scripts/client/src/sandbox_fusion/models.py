@@ -115,6 +115,7 @@ class RunStatus(str, Enum):
 class RunCodeRequest(BaseModel):
     compile_timeout: float = Field(10, description='compile timeout for compiled languages')
     run_timeout: float = Field(10, description='code run timeout')
+    memory_limit_MB: int = Field(-1, description='maximum memory allowed in megabytes')
     code: str = Field(..., examples=['print("hello")'], description='the code to run')
     stdin: Optional[str] = Field(None, examples=[''], description='optional string to pass into stdin')
     language: Language = Field(..., examples=['python'], description='the language or execution mode to run the code')

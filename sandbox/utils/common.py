@@ -63,6 +63,7 @@ def find_conda_root():
         python_executable = sys.executable
         env_root = python_executable
         current_dir = env_root
+        conda_root = None
 
         while current_dir:
             if env_root != current_dir and os.path.exists(os.path.join(current_dir, 'condabin')):
@@ -78,8 +79,27 @@ def find_conda_root():
 
         if conda_root and os.path.isdir(conda_root):
             return conda_root
-        else:
-            return "Conda root directory not found."
+
+        # Fallback: check well-known conda installation paths
+        # This handles cases where conda envs are installed outside
+        # the conda root (e.g. /venv/sandbox-server/ instead of
+        # /opt/miniforge3/envs/sandbox-server/)
+        import shutil
+        conda_bin = shutil.which('conda')
+        if conda_bin:
+            # e.g. /opt/miniforge3/bin/conda -> /opt/miniforge3
+            candidate = os.path.dirname(os.path.dirname(os.path.realpath(conda_bin)))
+            if os.path.isdir(os.path.join(candidate, 'condabin')):
+                return candidate
+
+        for candidate in ['/opt/conda', '/opt/miniforge3', '/opt/miniconda3',
+                          os.path.expanduser('~/miniconda3'),
+                          os.path.expanduser('~/miniforge3'),
+                          os.path.expanduser('~/anaconda3')]:
+            if os.path.isdir(os.path.join(candidate, 'condabin')):
+                return candidate
+
+        return "Conda root directory not found."
     except Exception as e:
         return f"An unexpected error occurred: {e}"
 
