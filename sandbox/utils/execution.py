@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import os
 import shutil
+import signal
 import sys
 from functools import cache, wraps
 from typing import Any, Callable, Coroutine, TypeVar
@@ -38,13 +39,28 @@ def try_decode(s: bytes) -> str:
 
 
 async def get_output_non_blocking(fd):
-    res = b''
+    res, _ = await drain_stream_with_timeout(fd, timeout=0.2)
+    return res
+
+
+async def drain_stream(fd) -> str:
+    if fd is None:
+        return ''
     try:
-        # read up to 1MB
-        res = await asyncio.wait_for(fd.read(1024 * 1024), timeout=0.0001)
+        return try_decode(await fd.read())
+    except Exception as e:
+        return f'[ReadError] {e}'
+
+
+async def drain_stream_with_timeout(fd, timeout: float, timeout_marker: str = '[DrainTimeout]') -> tuple[str, str]:
+    if fd is None:
+        return '', 'empty'
+    try:
+        return await asyncio.wait_for(drain_stream(fd), timeout=timeout), 'ok'
     except asyncio.TimeoutError:
-        pass
-    return try_decode(res)
+        return timeout_marker, 'drain_timeout'
+    except Exception as e:
+        return f'[ReadError] {e}', 'read_error'
 
 
 def kill_process_tree(pid):
@@ -56,6 +72,17 @@ def kill_process_tree(pid):
         parent.kill()
     except Exception as e:
         logger.warn(f'error on killing process tree: {e}')
+
+
+def kill_process_group(pgid, sig: signal.Signals = signal.SIGKILL):
+    if not pgid or pgid <= 0:
+        return
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        logger.warn(f'error on killing process group {pgid}: {e}')
 
 
 current_pid = os.getpid()

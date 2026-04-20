@@ -20,19 +20,23 @@ import time
 import traceback
 from typing import Dict, List, Optional
 
-import psutil
-import structlog
 import platform
 import resource
+import structlog
 
 from sandbox.configs.run_config import RunConfig
 from sandbox.runners.isolation import tmp_cgroup, tmp_netns, tmp_overlayfs
 from sandbox.runners.types import CodeRunArgs, CodeRunResult, CommandRunResult, CommandRunStatus
 from sandbox.utils.common import set_permissions_recursively
-from sandbox.utils.execution import cleanup_process, ensure_bash_integrity, get_output_non_blocking, kill_process_tree
+from sandbox.utils.execution import cleanup_process, drain_stream_with_timeout, ensure_bash_integrity, kill_process_group
 
 logger = structlog.stdlib.get_logger()
 config = RunConfig.get_instance_sync()
+
+
+def _is_closed_stdin_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "handler is closed" in message or "broken pipe" in message
 
 
 async def run_command_bare(command: str | List[str],
@@ -53,7 +57,8 @@ async def run_command_bare(command: str | List[str],
                                                          **os.environ,
                                                          **(extra_env or {})
                                                      },
-                                                     preexec_fn=preexec_fn)
+                                                     preexec_fn=preexec_fn,
+                                                     start_new_session=True)
         else:
             p = await asyncio.create_subprocess_shell(command,
                                                       stdin=subprocess.PIPE,
@@ -65,7 +70,8 @@ async def run_command_bare(command: str | List[str],
                                                           **os.environ,
                                                           **(extra_env or {})
                                                       },
-                                                      preexec_fn=preexec_fn)
+                                                      preexec_fn=preexec_fn,
+                                                      start_new_session=True)
         if stdin is not None:
             try:
                 if p.stdin:
@@ -74,37 +80,100 @@ async def run_command_bare(command: str | List[str],
                 else:
                     logger.warning("Attempted to write to stdin, but stdin is closed.")
             except Exception as e:
-                logger.exception(f"Failed to write to stdin: {e}")
+                if _is_closed_stdin_error(e):
+                    logger.warning("Failed to write to stdin because the child process already closed stdin.",
+                                   error=str(e))
+                else:
+                    logger.exception(f"Failed to write to stdin: {e}")
         if p.stdin:
             try:
                 p.stdin.close()
                 await p.stdin.wait_closed()
             except Exception as e:
-                logger.warning(f"Failed to close stdin: {e}")
+                if _is_closed_stdin_error(e):
+                    logger.warning("Failed to close stdin because the pipe was already closed.", error=str(e))
+                else:
+                    logger.warning(f"Failed to close stdin: {e}")
         start_time = time.time()
+        timed_out = False
+        execution_time = None
+        pgid = p.pid
+        stdout_text = ''
+        stderr_text = ''
+        drain_status = {'stdout': 'not_read', 'stderr': 'not_read'}
+
+        async def _read_streams(timeout_s: float, *, read_stdout: bool = True, read_stderr: bool = True):
+            nonlocal stdout_text, stderr_text, drain_status
+            results = []
+            if read_stdout:
+                results.append(('stdout', await drain_stream_with_timeout(p.stdout, timeout=timeout_s)))
+            if read_stderr:
+                results.append(('stderr', await drain_stream_with_timeout(p.stderr, timeout=timeout_s)))
+
+            for stream_name, (stream_text, stream_status) in results:
+                if stream_name == 'stdout':
+                    stdout_text = stream_text
+                else:
+                    stderr_text = stream_text
+                drain_status[stream_name] = stream_status
+
         try:
             await asyncio.wait_for(p.wait(), timeout=timeout)
             execution_time = time.time() - start_time
             logger.debug(f'stop running command {command}')
+            await _read_streams(timeout_s=0.2)
+            if 'drain_timeout' in drain_status.values():
+                # Descendants may still be holding stdout/stderr open. Clean the
+                # request-scoped process group before the final guarded drain.
+                retry_stdout = drain_status['stdout'] == 'drain_timeout'
+                retry_stderr = drain_status['stderr'] == 'drain_timeout'
+                kill_process_group(pgid)
+                try:
+                    await asyncio.wait_for(p.wait(), timeout=1.0)
+                except Exception:
+                    pass
+                await _read_streams(timeout_s=1.0, read_stdout=retry_stdout, read_stderr=retry_stderr)
+            else:
+                # Output has drained cleanly, so it is now safe to best-effort
+                # clean any lingering descendants in this request's process group.
+                kill_process_group(pgid)
         except asyncio.TimeoutError:
-            return CommandRunResult(status=CommandRunStatus.TimeLimitExceeded,
-                                    execution_time=time.time() - start_time,
-                                    stdout=await get_output_non_blocking(p.stdout),
-                                    stderr=await get_output_non_blocking(p.stderr))
+            timed_out = True
+            execution_time = time.time() - start_time
+            kill_process_group(pgid)
+            try:
+                await asyncio.wait_for(p.wait(), timeout=1.0)
+            except Exception:
+                pass
+            await _read_streams(timeout_s=1.0)
         finally:
-            if psutil.pid_exists(p.pid):
-                kill_process_tree(p.pid)
-                logger.info(f'process killed: {p.pid}')
             if config.sandbox.cleanup_process:
                 cleanup_process()
             if config.sandbox.restore_bash:
                 ensure_bash_integrity()
 
+        if 'drain_timeout' in drain_status.values():
+            logger.warning('command output drain timed out',
+                           command=command,
+                           pid=p.pid,
+                           pgid=pgid,
+                           timed_out=timed_out,
+                           stdout_status=drain_status['stdout'],
+                           stderr_status=drain_status['stderr'],
+                           stdout_len=len(stdout_text or ''),
+                           stderr_len=len(stderr_text or ''))
+
+        if timed_out:
+            return CommandRunResult(status=CommandRunStatus.TimeLimitExceeded,
+                                    execution_time=execution_time,
+                                    stdout=stdout_text,
+                                    stderr=stderr_text)
+
         return CommandRunResult(status=CommandRunStatus.Finished,
                                 execution_time=execution_time,
                                 return_code=p.returncode,
-                                stdout=await get_output_non_blocking(p.stdout),
-                                stderr=await get_output_non_blocking(p.stderr))
+                                stdout=stdout_text,
+                                stderr=stderr_text)
     except Exception as e:
         message = f'exception on running command {command}: {e} | {traceback.print_tb(e.__traceback__)}'
         logger.warning(message)
